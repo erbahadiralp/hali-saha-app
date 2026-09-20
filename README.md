@@ -1,4 +1,4 @@
-# MaçVar
+# Halı Saha Organizasyonu & Kadro Kurucu
 
 Halı saha maçlarını organize etmek, takımları adil şekilde dengelemek ve oyuncu
 istatistiklerini takip etmek için geliştirilen cross-platform mobil uygulama.
