@@ -6,7 +6,11 @@ const db = admin.firestore();
 
 // Firestore lives in eur3; running functions next to it avoids cross-region latency and egress.
 // Keep in sync with getFunctions(app, FUNCTIONS_REGION) in firebaseConfig.ts.
-const regional = functions.region("europe-west1");
+//
+// maxInstances caps how many copies of a function can run at once, which puts a ceiling on the
+// bill if a trigger ever misbehaves or traffic spikes unexpectedly. Ten is generous for the
+// current scale; raise it before launch if real traffic starts queueing.
+const regional = functions.region("europe-west1").runWith({ maxInstances: 10 });
 
 // ============================================================
 // 1. WAITLIST MANAGEMENT - When a player leaves, notify waitlist

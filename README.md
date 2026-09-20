@@ -166,3 +166,13 @@ yazıldı, ardından adım adım hayata geçirildi. AI çıktısı doğrudan kab
 ## Durum
 
 Aktif geliştirme aşamasında. Henüz mağazalarda yayında değil.
+
+---
+
+## Lisans
+
+© 2026 Bahadır Alp Er. Tüm hakları saklıdır.
+
+Bu depo portfolyo ve kod inceleme amacıyla yayınlanmıştır. Kodun tamamının
+veya bir bölümünün izinsiz kullanılması, çoğaltılması veya türev bir ürün
+olarak dağıtılması serbest değildir.
