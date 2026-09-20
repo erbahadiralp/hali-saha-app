@@ -1,0 +1,370 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===== HELPER FUNCTIONS =====
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // getAfter sees the state after the whole transaction/batch, i.e. including the reservation written with it.
+    function ownsUsernameAfterWrite(name) {
+      let reservation = getAfter(/databases/$(database)/documents/usernames/$(name));
+      return reservation != null && reservation.data.uid == request.auth.uid;
+    }
+
+    function isGroupAdmin(groupId) {
+      let group = get(/databases/$(database)/documents/groups/$(groupId));
+      return isAuthenticated() && (
+        request.auth.uid == group.data.adminId ||
+        request.auth.uid in group.data.admins
+      );
+    }
+
+    function isGroupMember(groupId) {
+      let group = get(/databases/$(database)/documents/groups/$(groupId));
+      return isAuthenticated() && request.auth.uid in group.data.members;
+    }
+
+    function isMatchCreatorOrGroupAdmin(matchId) {
+      let matchDoc = get(/databases/$(database)/documents/matches/$(matchId));
+      let isCreator = request.auth.uid == matchDoc.data.creatorId;
+      let hasGroup = matchDoc.data.groupId != null;
+      return isCreator || (hasGroup && isGroupAdmin(matchDoc.data.groupId));
+    }
+
+    // Same check against the state after the batch, for participants written together with a new match.
+    function isMatchCreatorAfterWrite(matchId) {
+      let matchDoc = getAfter(/databases/$(database)/documents/matches/$(matchId));
+      return matchDoc != null && request.auth.uid == matchDoc.data.creatorId;
+    }
+
+    // Participant ids are always `${matchId}_${userId}`.
+    function isMatchParticipant(matchId) {
+      return exists(/databases/$(database)/documents/match_participants/$(matchId + '_' + request.auth.uid));
+    }
+
+    function changedKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    // Group invites use the id `group_${groupId}_${toUserId}` so the group rule can look them up.
+    function hasPendingGroupInvite(groupId) {
+      let path = /databases/$(database)/documents/invites/$('group_' + groupId + '_' + request.auth.uid);
+      return exists(path) && get(path).data.status == 'pending';
+    }
+
+    function isValidGroupInvite(inviteId) {
+      let data = request.resource.data;
+      return data.type != 'group' || (
+        isGroupMember(data.targetId) &&
+        inviteId == 'group_' + data.targetId + '_' + data.toUserId
+      );
+    }
+
+    // ===== USERNAMES (for registration username availability check) =====
+    match /usernames/{username} {
+      // Allow anyone to check if a username exists (needed for registration)
+      allow read: if true;
+      // A reservation can only be created for yourself, with a valid name, and never re-assigned.
+      // Creating an existing doc is an update, so a taken name can't be overwritten by someone else.
+      allow create: if isAuthenticated()
+        && request.resource.data.uid == request.auth.uid
+        && username.matches('^[a-z0-9_]{3,20}$');
+      allow update: if isAuthenticated()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.uid == request.auth.uid;
+      allow delete: if isAuthenticated() && resource.data.uid == request.auth.uid;
+    }
+
+    // ===== USERS =====
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isOwner(userId)
+        && (!('username' in request.resource.data) || ownsUsernameAfterWrite(request.resource.data.username));
+      allow update: if isOwner(userId)
+        // A new username must be reserved for this user in the same write (claimUsername transaction).
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['username']) || ownsUsernameAfterWrite(request.resource.data.username))
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['createdAt']))
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['overall', 'performanceScore']))
+        // Match counters are rebuilt by Cloud Functions from match_participants; clients must not write them.
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['stats', 'matchesPlayed', 'statsVersion', 'statsUpdatedAt', 'lastMatchDate', 'mvpCount']))
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['subscription', 'isPremium', 'tier']))
+        // Deletion state is set and cleared only by the requestAccountDeletion / restoreAccount functions.
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['isDeleted', 'deletedAt', 'deletionScheduledFor', 'deletionReason', 'restoredAt']))
+        && (request.resource.data.displayName is string && request.resource.data.displayName.size() <= 50 || !request.resource.data.diff(resource.data).affectedKeys().hasAny(['displayName']))
+        && (request.resource.data.username is string && request.resource.data.username.size() <= 20 || !request.resource.data.diff(resource.data).affectedKeys().hasAny(['username']))
+        // Allow other authenticated users to update only follower/following counts (for follow/unfollow)
+        || (isAuthenticated() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['followersCount', 'followingCount']));
+      allow delete: if false;
+
+      match /followers/{followerId} {
+        allow read: if isAuthenticated();
+        allow write: if isAuthenticated() && request.auth.uid == followerId;
+      }
+
+      match /following/{followingId} {
+        allow read: if isAuthenticated();
+        allow write: if isOwner(userId);
+      }
+
+      match /blockedUsers/{blockedId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // ===== GROUPS =====
+    match /groups/{groupId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated()
+        && request.resource.data.adminId == request.auth.uid
+        && request.auth.uid in request.resource.data.members
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1
+        && request.resource.data.name.size() <= 50;
+      allow update: if isAuthenticated() && (
+        isGroupAdmin(groupId) ||
+        // Leave: a member removes only themselves.
+        (changedKeys().hasOnly(['members']) &&
+         resource.data.members.toSet().difference(request.resource.data.members.toSet()) == [request.auth.uid].toSet() &&
+         request.resource.data.members.toSet().difference(resource.data.members.toSet()).size() == 0) ||
+        // Join: a user adds only themselves; private groups additionally need a pending invite.
+        (changedKeys().hasOnly(['members']) &&
+         request.resource.data.members.toSet().difference(resource.data.members.toSet()) == [request.auth.uid].toSet() &&
+         resource.data.members.toSet().difference(request.resource.data.members.toSet()).size() == 0 &&
+         request.resource.data.members.size() <= 50 &&
+         (resource.data.get('privacy', 'public') != 'private' || hasPendingGroupInvite(groupId)))
+      );
+      allow delete: if isAuthenticated() && resource.data.adminId == request.auth.uid;
+    }
+
+    // ===== MATCHES =====
+    match /matches/{matchId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated()
+        && request.resource.data.creatorId == request.auth.uid
+        && request.resource.data.venue is string
+        && request.resource.data.venue.size() >= 1
+        && request.resource.data.maxPlayers is number
+        && request.resource.data.maxPlayers >= 2
+        && request.resource.data.maxPlayers <= 30
+        && (request.resource.data.feePerPerson is number && request.resource.data.feePerPerson >= 0 || !('feePerPerson' in request.resource.data));
+      allow update: if isAuthenticated() && (
+        resource.data.creatorId == request.auth.uid ||
+        (resource.data.groupId != null && isGroupAdmin(resource.data.groupId)) ||
+        // Joining/leaving moves playerCount by exactly one.
+        (changedKeys().hasOnly(['playerCount', 'updatedAt']) &&
+         request.resource.data.playerCount is number &&
+         request.resource.data.playerCount >= 0 &&
+         (request.resource.data.playerCount - resource.data.get('playerCount', 0)) in [-1, 1])
+      );
+      allow delete: if isAuthenticated() && (
+        resource.data.creatorId == request.auth.uid ||
+        (resource.data.groupId != null && isGroupAdmin(resource.data.groupId))
+      );
+    }
+
+    // ===== MATCH PARTICIPANTS =====
+    match /match_participants/{participantId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated()
+        && participantId == request.resource.data.matchId + '_' + request.resource.data.userId
+        && (
+          // The organizer (or a group admin) adds guests, test players and rosters.
+          isMatchCreatorOrGroupAdmin(request.resource.data.matchId) ||
+          isMatchCreatorAfterWrite(request.resource.data.matchId) ||
+          // Players join themselves, only before the result and without awards, payments or a team.
+          (request.resource.data.userId == request.auth.uid &&
+           get(/databases/$(database)/documents/matches/$(request.resource.data.matchId)).data.get('status', 'UPCOMING') != 'FINISHED' &&
+           get(/databases/$(database)/documents/matches/$(request.resource.data.matchId)).data.get('isDeleted', false) != true &&
+           !request.resource.data.keys().hasAny(['isMotm', 'isMvp', 'paid', 'paidAmount']) &&
+           request.resource.data.get('team', null) == null)
+        );
+      allow update: if isAuthenticated() && (
+        isMatchCreatorOrGroupAdmin(resource.data.matchId) ||
+        // Players edit their own entry (status, own stats) but not awards, payments or their team.
+        (resource.data.userId == request.auth.uid &&
+         !changedKeys().hasAny(['userId', 'matchId', 'isMotm', 'isMvp', 'paid', 'paidAmount']) &&
+         (!changedKeys().hasAny(['team', 'teamIndex']) || request.resource.data.get('team', null) == null)) ||
+        // Waitlist promotion (WAITLIST -> IN) by whoever frees the spot
+        (resource.data.status == 'WAITLIST' && request.resource.data.status == 'IN' &&
+         changedKeys().hasOnly(['status', 'updatedAt']))
+      )
+      // Validate stats fields if being updated (non-negative, reasonable range)
+      && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['goals']) || (request.resource.data.goals is number && request.resource.data.goals >= 0 && request.resource.data.goals <= 50))
+      && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['assists']) || (request.resource.data.assists is number && request.resource.data.assists >= 0 && request.resource.data.assists <= 50))
+      && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['saves']) || (request.resource.data.saves is number && request.resource.data.saves >= 0 && request.resource.data.saves <= 100));
+      allow delete: if isAuthenticated() && (
+        resource.data.userId == request.auth.uid ||
+        isMatchCreatorOrGroupAdmin(resource.data.matchId)
+      );
+    }
+
+    // ===== NOTIFICATIONS =====
+    match /notifications/{notificationId} {
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      // Restrict creation: users can only create notifications where they're the sender
+      allow create: if isAuthenticated() && (
+        request.resource.data.userId == request.auth.uid ||
+        request.resource.data.fromUserId == request.auth.uid ||
+        request.resource.data.senderId == request.auth.uid
+      );
+      allow update: if isAuthenticated() && resource.data.userId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+    }
+
+    // ===== INVITES =====
+    match /invites/{inviteId} {
+      // resource == null lets an inviter check whether a deterministic group invite already exists.
+      allow read: if isAuthenticated() && (
+        resource == null ||
+        resource.data.toUserId == request.auth.uid ||
+        resource.data.fromUserId == request.auth.uid ||
+        (resource.data.type == 'group' && isGroupMember(resource.data.targetId))
+      );
+      allow create: if isAuthenticated()
+        && request.resource.data.fromUserId == request.auth.uid
+        && request.resource.data.toUserId != request.auth.uid
+        && isValidGroupInvite(inviteId);
+      allow update: if isAuthenticated() && (
+        resource.data.toUserId == request.auth.uid ||
+        resource.data.fromUserId == request.auth.uid ||
+        // Another member may re-send a closed (accepted/rejected) group invite.
+        (resource.data.status != 'pending' &&
+         request.resource.data.fromUserId == request.auth.uid &&
+         request.resource.data.toUserId != request.auth.uid &&
+         isValidGroupInvite(inviteId))
+      );
+      allow delete: if isAuthenticated() && (
+        resource.data.toUserId == request.auth.uid ||
+        resource.data.fromUserId == request.auth.uid
+      );
+    }
+
+    // ===== GROUP REQUESTS =====
+    match /group_requests/{requestId} {
+      // Any authenticated user can read (admin filtering happens client-side)
+      allow read: if isAuthenticated();
+      // Only authenticated users can create requests for themselves
+      allow create: if isAuthenticated()
+        && request.resource.data.userId == request.auth.uid;
+      // Only group admin can update (accept/reject)
+      allow update: if isAuthenticated() && isGroupAdmin(resource.data.groupId);
+      // Requester or group admin can delete
+      allow delete: if isAuthenticated() && (
+        resource.data.userId == request.auth.uid ||
+        isGroupAdmin(resource.data.groupId)
+      );
+    }
+
+    // ===== VOTES =====
+    match /votes/{voteId} {
+      allow read: if isAuthenticated();
+      // Users can only create votes with their own userId, one per matchId
+      allow create: if isAuthenticated()
+        && (request.resource.data.odaylarId == request.auth.uid || request.resource.data.oylayanId == request.auth.uid);
+      // No updates or deletes - votes are immutable
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ===== DEBTS =====
+    match /debts/{debtId} {
+      allow read: if isAuthenticated() && (
+        resource.data.userId == request.auth.uid ||
+        resource.data.creatorId == request.auth.uid
+      );
+      // Only match admin can create debts
+      allow create: if isAuthenticated()
+        && request.resource.data.creatorId == request.auth.uid;
+      // Only the debt creator or the debtor can update (mark as paid)
+      allow update: if isAuthenticated() && (
+        resource.data.userId == request.auth.uid ||
+        resource.data.creatorId == request.auth.uid
+      );
+      // Only the creator can delete
+      allow delete: if isAuthenticated() && resource.data.creatorId == request.auth.uid;
+    }
+
+    // ===== USER BADGES =====
+    match /users/{userId}/badges/{badgeId} {
+      allow read: if isAuthenticated();
+      // Only the system (via Cloud Functions) or the user can write badges
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId);
+      allow delete: if false; // Badges cannot be deleted
+    }
+
+    // ===== MVP SESSIONS =====
+    match /mvp_sessions/{sessionId} {
+      allow read: if isAuthenticated();
+      // The first player to open voting creates the session; only the organizer changes or removes it.
+      allow create: if isAuthenticated()
+        && request.resource.data.matchId == sessionId
+        && (isMatchParticipant(sessionId) || isMatchCreatorOrGroupAdmin(sessionId));
+      allow update, delete: if isAuthenticated() && isMatchCreatorOrGroupAdmin(sessionId);
+    }
+
+    // ===== MVP VOTES =====
+    match /mvp_votes/{voteId} {
+      allow read: if isAuthenticated();
+      // Only players of the match vote, as themselves.
+      allow create: if isAuthenticated()
+        && request.resource.data.oylayanId == request.auth.uid
+        && isMatchParticipant(request.resource.data.matchId);
+      allow update: if false;
+      allow delete: if isAuthenticated() && isMatchCreatorOrGroupAdmin(resource.data.matchId);
+    }
+
+    // ===== DISPUTES =====
+    match /disputes/{disputeId} {
+      allow read: if isAuthenticated() && (
+        resource.data.playerId == request.auth.uid ||
+        resource.data.adminId == request.auth.uid ||
+        resource.data.isSimulation == true
+      );
+      allow create: if isAuthenticated() && (
+        request.resource.data.playerId == request.auth.uid ||
+        request.resource.data.isSimulation == true
+      );
+      allow update: if isAuthenticated() && (
+        resource.data.playerId == request.auth.uid ||
+        resource.data.adminId == request.auth.uid ||
+        resource.data.isSimulation == true
+      );
+      allow delete: if isAuthenticated() && (
+        resource.data.playerId == request.auth.uid ||
+        resource.data.adminId == request.auth.uid ||
+        resource.data.isSimulation == true
+      );
+    }
+
+    // ===== VACATION MODE =====
+    match /vacation_mode/{vacationId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated()
+        && request.resource.data.userId == request.auth.uid;
+      allow update: if isAuthenticated()
+        && resource.data.userId == request.auth.uid;
+      allow delete: if false;
+    }
+
+    // ===== REPORTS =====
+    match /reports/{reportId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && request.resource.data.reporterId == request.auth.uid;
+      allow delete: if isAuthenticated() && resource.data.reporterId == request.auth.uid;
+      allow update: if false;
+    }
+
+    // Deny all other access
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

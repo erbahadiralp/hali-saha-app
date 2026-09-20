@@ -1,0 +1,79 @@
+# Dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native builds
+ios/
+android/
+
+
+# Environment variables
+.env
+.env.local
+.env.production
+
+# Firebase
+firebase-debug.log
+firebase-debug.*.log
+.firebase/
+functions/lib/
+functions/node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+*.log
+
+# TypeScript
+*.tsbuildinfo
+
+# EAS
+.easignore
+
+# Testing
+coverage/
+
+# Misc
+*.orig
+*.bak
+splash-animation-optimization.md
+
+#Design
+stitch_home_page_dashboard/
+cercop/
+scratch/
+
+#Task
+plan.txt
+task.yaml
+task2.yaml
+task_bugs.yaml
+duzeltme-listesi.md
+player-setup-code-review.md
+splash-animation-optimization.md
+feature.pdf
+overall-system-final.md
+code_review_report.md
+player-cards.jsx
+implementation_plan.pdf
+kadrola_overall_mvp_sistem_guncellemeleri(1).md
+plan.md
+
+#Logo
+logo.png
+
+#Json
+istanbul_halisaha_listesi.json
+design/

@@ -1,0 +1,71 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // ===== HELPER FUNCTIONS =====
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isImageType() {
+      return request.resource.contentType.matches('image/.*');
+    }
+
+    function isUnder5MB() {
+      return request.resource.size < 5 * 1024 * 1024;
+    }
+
+    function isGroupAdmin(groupId) {
+      let group = firestore.get(/databases/(default)/documents/groups/$(groupId));
+      return isAuthenticated() && (
+        request.auth.uid == group.data.adminId ||
+        (group.data.admins != null && request.auth.uid in group.data.admins)
+      );
+    }
+
+    // ===== PROFILE AVATARS =====
+    // Path: avatars/{userId}/{fileName}
+    match /avatars/{userId}/{fileName} {
+      // Anyone authenticated can view profile photos
+      allow read: if isAuthenticated();
+      // Only the user themselves can upload/delete their own avatar
+      allow write: if isOwner(userId)
+        && isImageType()
+        && isUnder5MB();
+      allow delete: if isOwner(userId);
+    }
+
+    // ===== GROUP PHOTOS =====
+    // Path: groups/{groupId}/{fileName}
+    match /groups/{groupId}/{fileName} {
+      // Anyone authenticated can view group photos
+      allow read: if isAuthenticated();
+      // Only temp group creator or group admin can upload/delete
+      allow write: if isAuthenticated()
+        && (groupId == 'temp_' + request.auth.uid || isGroupAdmin(groupId))
+        && isImageType()
+        && isUnder5MB();
+      allow delete: if isAuthenticated()
+        && (groupId == 'temp_' + request.auth.uid || isGroupAdmin(groupId));
+    }
+
+    // ===== MATCH PHOTOS =====
+    // Path: matches/{fileName}
+    match /matches/{fileName} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated()
+        && isImageType()
+        && isUnder5MB();
+      allow delete: if isAuthenticated();
+    }
+
+    // Deny everything else
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
